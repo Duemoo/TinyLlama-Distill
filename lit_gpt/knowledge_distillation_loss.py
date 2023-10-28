@@ -6,7 +6,7 @@ import torch.nn.functional as F
 class KDLoss(nn.Module):
     """Knowledge Distillation loss."""
 
-    def __init__(self, dim: int = -1, scale_T: bool = True) -> None:
+    def __init__(self, dim: int = -1, scale_T: bool = True, setting: str = "train") -> None:
         """Initializer for KDLoss.
         
         Args:
@@ -17,6 +17,7 @@ class KDLoss(nn.Module):
         
         self.dim = dim
         self.scale_T = scale_T
+        self.setting = setting
         
     def forward(self, pred: torch.Tensor, target: torch.Tensor, teacher_pred: torch.Tensor, T: float, alpha: float, beta: float = None) -> torch.Tensor:
         """Forward method for KDLoss.
@@ -36,7 +37,7 @@ class KDLoss(nn.Module):
         assert T >= 1.0, f"Expected temperature greater or equal to 1.0, but got {T}."
         
         if beta == None:
-            assert alpha < 1.0, f"For weighted average (beta=None), alpha must be less than 1.0, but got {alpha}."
+            # assert alpha < 1.0, f"For weighted average (beta=None), alpha must be less than 1.0, but got {alpha}."
             beta = 1.0 - alpha
         
         if self.scale_T:
@@ -48,4 +49,7 @@ class KDLoss(nn.Module):
         kldiv = F.kl_div(pred_log_probs, teacher_pred_log_probs, log_target=True)
         crossentropy = F.cross_entropy(pred.transpose(1, 2), target)
         
-        return alpha * kldiv + beta * crossentropy
+        if self.setting == "train":
+            return alpha * kldiv + beta * crossentropy
+        else:
+            return (kldiv, crossentropy, alpha * kldiv + beta * crossentropy)
