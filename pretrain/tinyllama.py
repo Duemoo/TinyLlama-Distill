@@ -21,17 +21,21 @@ from lit_gpt.speed_monitor import estimate_flops, measure_flops
 from lit_gpt.utils import chunked_cross_entropy, get_default_supported_precision, num_parameters, step_csv_logger, lazy_load
 from pytorch_lightning.loggers import WandbLogger
 from lit_gpt import FusedCrossEntropyLoss
+from lit_gpt.knowledge_distillation_loss import KDLoss
 import random
+from lit_gpt import Tokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from tqdm import tqdm
 
-model_name = "tiny_LLaMA_1b"
-name = "tinyllama_1b"
+model_name = "tiny_LLaMA_120M"
+name = "tinyllama_120M"
 out_dir = Path("out") / name
 
 # Hyperparameters
 num_of_devices = 8
 global_batch_size = 512
 learning_rate = 4e-4
-micro_batch_size = 8
+micro_batch_size = 2
 max_step = 715256 * 2
 warmup_steps = 2000
 log_step_interval = 10
@@ -61,9 +65,12 @@ log_iter_interval = log_step_interval * gradient_accumulation_steps
 
 
 # Treat all dataset equally by their size. If you want to use a different weight for a dataset, add it to the list with the weight.
+# train_data_config = [
+#     ("train_slim", 0.693584),
+#     ("train_star", 0.306416),
+# ]
 train_data_config = [
-    ("train_slim", 0.693584),
-    ("train_star", 0.306416),
+    ("train_slim", 0.693584)
 ]
 
 val_data_config = [
@@ -113,11 +120,11 @@ def main(fabric, train_data_dir, val_data_dir, resume):
     if fabric.global_rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    config = Config.from_name(model_name)
+    student_config = Config.from_name(model_name)
 
     train_dataloader, val_dataloader = create_dataloaders(
         batch_size=micro_batch_size,
-        block_size=config.block_size,
+        block_size=student_config.block_size,
         fabric=fabric,
         train_data_dir=train_data_dir,
         val_data_dir=val_data_dir,
@@ -130,24 +137,24 @@ def main(fabric, train_data_dir, val_data_dir, resume):
 
     fabric.seed_everything(3407)  # same seed for every process to init model (FSDP)
 
-    fabric.print(f"Loading model with {config.__dict__}")
+    fabric.print(f"Loading model with {student_config.__dict__}")
     t0 = time.perf_counter()
     with fabric.init_module(empty_init=True):
-        model = GPT(config)
-        model.apply(partial(model._init_weights ,n_layer=config.n_layer))
+        student_model = GPT(student_config)
+        student_model.apply(partial(student_model._init_weights ,n_layer=student_config.n_layer))
  
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
-    fabric.print(f"Total parameters {num_parameters(model):,}")
+    fabric.print(f"Total parameters {num_parameters(student_model):,}")
 
-    model = fabric.setup(model)
+    student_model = fabric.setup(student_model)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False
+        student_model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False
     )
     # optimizer = FusedAdam(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2),adam_w_mode=True)
     optimizer = fabric.setup_optimizers(optimizer)
 
-    state = {"model": model, "optimizer": optimizer, "hparams": hparams, "iter_num": 0, "step_count": 0}
+    state = {"student_model": student_model, "optimizer": optimizer, "hparams": hparams, "iter_num": 0, "step_count": 0}
 
     if resume is True:
         resume = sorted(out_dir.glob("*.pth"))[-1]
@@ -163,20 +170,20 @@ def main(fabric, train_data_dir, val_data_dir, resume):
 
 
 def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
-    model = state["model"]
+    student_model = state["student_model"]
     optimizer = state["optimizer"]
 
     if val_dataloader is not None:
-        validate(fabric, model, val_dataloader)  # sanity check
+        validate(fabric, student_model, val_dataloader)  # sanity check
 
     with torch.device("meta"):
-        meta_model = GPT(model.config)
+        meta_model = GPT(student_model.config)
         # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
         # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
         # consider passing `SpeedMonitor(flops_per_batch=estimated_flops)` instead
         estimated_flops = estimate_flops(meta_model) * micro_batch_size
         fabric.print(f"Estimated TFLOPs: {estimated_flops * fabric.world_size / 1e12:.2f}")
-        x = torch.randint(0, 1, (micro_batch_size, model.config.block_size))
+        x = torch.randint(0, 1, (micro_batch_size, student_model.config.block_size))
         # measured_flos run in meta. Will trigger fusedRMSNorm error
         #measured_flops = measure_flops(meta_model, x)
         #fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
@@ -193,9 +200,13 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
     
     initial_iter = state["iter_num"]
     curr_iter = 0
+    
+    teacher_model = AutoModelForCausalLM.from_pretrained("PY007/TinyLlama-1.1B-intermediate-step-480k-1T").to("cuda")
+    print(f"teacher model {teacher_model} can generate : {teacher_model.can_generate()}")
+    teacher_model.eval()
             
-    loss_func = FusedCrossEntropyLoss()
-    for  train_data in train_dataloader:
+    loss_func = KDLoss(dim=2)
+    for train_data in tqdm(train_dataloader):
         # resume loader state. This is not elegant but it works. Should rewrite it in the future.
         if resume:
             if curr_iter < initial_iter:
@@ -216,17 +227,25 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
 
         iter_t0 = time.perf_counter()
 
-        input_ids = train_data[:, 0 : model.config.block_size].contiguous()
-        targets = train_data[:, 1 : model.config.block_size + 1].contiguous()
+        input_ids = train_data[:, 0 : student_model.config.block_size].contiguous()
+        print(f"input_ids shape : {input_ids.shape}")
+        # print(input_ids)
+        # generation config check
+        teacher_output = teacher_model(input_ids)
+        teacher_model.to("cpu")
+        # print(teacher_output)
+        print(f"teacher_output's shape : {teacher_output['logits'].shape}")
+        targets = train_data[:, 1 : student_model.config.block_size + 1].contiguous()
         is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
-        with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
-            loss = loss_func(logits, targets)
+        with fabric.no_backward_sync(student_model, enabled=is_accumulating):
+            logits = student_model(input_ids)
+            print(f"logits: {logits.shape}")
+            loss = loss_func(pred=logits, target=targets, teacher_pred=teacher_output, T=2, alpha=0.5)
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)
 
         if not is_accumulating:
-            fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
+            fabric.clip_gradients(student_model, optimizer, max_norm=grad_clip)
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
@@ -260,12 +279,12 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
         if val_dataloader is not None and not is_accumulating and state["step_count"] % eval_step_interval == 0:
             
             t0 = time.perf_counter()
-            val_loss = validate(fabric, model, val_dataloader)
+            val_loss = validate(fabric, student_model, val_dataloader)
             t1 = time.perf_counter() - t0
             monitor.eval_end(t1)
             fabric.print(f"step {state['iter_num']}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms")
-            fabric.log_dict({"metric/val_loss": val_loss.item(), "total_tokens":  model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
-            fabric.log_dict({"metric/val_ppl": math.exp(val_loss.item()), "total_tokens":  model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
+            fabric.log_dict({"metric/val_loss": val_loss.item(), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
+            fabric.log_dict({"metric/val_ppl": math.exp(val_loss.item()), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
             fabric.barrier()
         if not is_accumulating and state["step_count"] % save_step_interval == 0:
             checkpoint_path = out_dir / f"iter-{state['iter_num']:06d}-ckpt.pth"
@@ -277,15 +296,18 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
 def validate(fabric: L.Fabric, model: torch.nn.Module, val_dataloader: DataLoader) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
+    teacher_model = AutoModelForCausalLM.from_pretrained("PY007/TinyLlama-1.1B-intermediate-step-480k-1T")
 
     losses = torch.zeros(eval_iters, device=fabric.device)
     for k, val_data in enumerate(val_dataloader):
         if k >= eval_iters:
             break
         input_ids = val_data[:, 0 : model.config.block_size].contiguous()
-        targets = val_data[:, 1 : model.config.block_size + 1].contiguous()
+        # generation config check
+        teacher_output = teacher_model.generate(input_ids)
+        # targets = val_data[:, 1 : model.config.block_size + 1].contiguous()
         logits = model(input_ids)
-        loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+        loss = chunked_cross_entropy(logits, teacher_output, chunk_size=0)
 
         # loss_func = FusedCrossEntropyLoss()
         # loss = loss_func(logits, targets)
