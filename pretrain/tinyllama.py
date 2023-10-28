@@ -79,7 +79,7 @@ val_data_config = [
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 logger = step_csv_logger("out", name, flush_logs_every_n_steps=log_iter_interval)
-wandb_logger = WandbLogger()
+wandb_logger = WandbLogger(entity="lklab_kaist", project="tinyllama_distill")
 
 
 def setup(
@@ -231,8 +231,9 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
         print(f"input_ids shape : {input_ids.shape}")
         # print(input_ids)
         # generation config check
-        teacher_output = teacher_model(input_ids)
-        teacher_model.to("cpu")
+        with torch.no_grad():
+            teacher_output = teacher_model(input_ids)
+        
         # print(teacher_output)
         print(f"teacher_output's shape : {teacher_output['logits'].shape}")
         targets = train_data[:, 1 : student_model.config.block_size + 1].contiguous()

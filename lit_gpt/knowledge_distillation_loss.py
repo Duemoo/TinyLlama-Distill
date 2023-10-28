@@ -46,8 +46,6 @@ class KDLoss(nn.Module):
         teacher_pred_log_probs = F.log_softmax(teacher_pred["logits"] / T, dim=self.dim)
         
         kldiv = F.kl_div(pred_log_probs, teacher_pred_log_probs, log_target=True)
-        print(f"kldiv shape : {kldiv.shape}")
-        crossentropy = F.cross_entropy(pred, target)
-        print(f"crossentropy shape : {crossentropy.shape}")
+        crossentropy = F.cross_entropy(pred.transpose(1, 2), target)
         
         return alpha * kldiv + beta * crossentropy
