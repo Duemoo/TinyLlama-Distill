@@ -6,4 +6,7 @@ lightning run model \
     --accelerator=cuda \
     --devices=8 \
     --num-nodes=1 \
-    pretrain/tinyllama.py --devices 8 --train_data_dir /home/hoyeon/TinyLlama-Distill/data/slim_processed_0.01
+    pretrain/tinyllama.py \
+        --train_data_dir /home/hoyeon/TinyLlama-Distill/data/slim_processed \
+        --val_data_dir /home/hoyeon/TinyLlama-Distill/data/slim_processed \
+        --devices 8

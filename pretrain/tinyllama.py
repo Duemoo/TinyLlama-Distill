@@ -35,13 +35,13 @@ out_dir = Path("out") / name
 num_of_devices = 8
 global_batch_size = 512
 learning_rate = 4e-4
-micro_batch_size = 2
+micro_batch_size = 16
 max_step = 715256 * 2
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
 save_step_interval = 5000
-eval_step_interval = 5000
+eval_step_interval = 200
 
 
 weight_decay = 1e-1
@@ -65,12 +65,8 @@ log_iter_interval = log_step_interval * gradient_accumulation_steps
 
 
 # Treat all dataset equally by their size. If you want to use a different weight for a dataset, add it to the list with the weight.
-# train_data_config = [
-#     ("train_slim", 0.693584),
-#     ("train_star", 0.306416),
-# ]
 train_data_config = [
-    ("train_slim", 0.693584)
+    ("train_slim", 1.0)
 ]
 
 val_data_config = [
@@ -78,6 +74,7 @@ val_data_config = [
 ]
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
+# automatically make version_XX directory in out_dir
 logger = step_csv_logger("out", name, flush_logs_every_n_steps=log_iter_interval)
 wandb_logger = WandbLogger(entity="lklab_kaist", project="tinyllama_distill")
 
@@ -142,12 +139,15 @@ def main(fabric, train_data_dir, val_data_dir, resume):
     with fabric.init_module(empty_init=True):
         student_model = GPT(student_config)
         student_model.apply(partial(student_model._init_weights ,n_layer=student_config.n_layer))
- 
+    teacher_model = AutoModelForCausalLM.from_pretrained("PY007/TinyLlama-1.1B-intermediate-step-480k-1T", use_flash_attention_2=True, torch_dtype=torch.bfloat16)
+    print(f"teacher model {teacher_model} can generate : {teacher_model.can_generate()}")
+    teacher_model.eval()
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters {num_parameters(student_model):,}")
 
     student_model = fabric.setup(student_model)
+    teacher_model = fabric.setup(teacher_model)
     optimizer = torch.optim.AdamW(
         student_model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False
     )
@@ -158,23 +158,24 @@ def main(fabric, train_data_dir, val_data_dir, resume):
 
     if resume is True:
         resume = sorted(out_dir.glob("*.pth"))[-1]
+        print(f"\n\nfind last checkpoint : {resume}")
     if resume :
         fabric.print(f"Resuming training from {resume}")
         fabric.load(resume, state)
 
     train_time = time.perf_counter()
-    train(fabric, state, train_dataloader, val_dataloader, monitor, resume)
+    train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 
-def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
+def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume):
     student_model = state["student_model"]
     optimizer = state["optimizer"]
 
     if val_dataloader is not None:
-        validate(fabric, student_model, val_dataloader)  # sanity check
+        validate(fabric, student_model, teacher_model, val_dataloader)  # sanity check
 
     with torch.device("meta"):
         meta_model = GPT(student_model.config)
@@ -200,13 +201,9 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
     
     initial_iter = state["iter_num"]
     curr_iter = 0
-    
-    teacher_model = AutoModelForCausalLM.from_pretrained("PY007/TinyLlama-1.1B-intermediate-step-480k-1T").to("cuda")
-    print(f"teacher model {teacher_model} can generate : {teacher_model.can_generate()}")
-    teacher_model.eval()
             
-    loss_func = KDLoss(dim=2)
-    for train_data in tqdm(train_dataloader):
+    loss_func = KDLoss(setting="train")
+    for train_data in train_dataloader:
         # resume loader state. This is not elegant but it works. Should rewrite it in the future.
         if resume:
             if curr_iter < initial_iter:
@@ -228,20 +225,14 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
         iter_t0 = time.perf_counter()
 
         input_ids = train_data[:, 0 : student_model.config.block_size].contiguous()
-        print(f"input_ids shape : {input_ids.shape}")
-        # print(input_ids)
         # generation config check
         with torch.no_grad():
             teacher_output = teacher_model(input_ids)
-        
-        # print(teacher_output)
-        print(f"teacher_output's shape : {teacher_output['logits'].shape}")
         targets = train_data[:, 1 : student_model.config.block_size + 1].contiguous()
         is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
         with fabric.no_backward_sync(student_model, enabled=is_accumulating):
             logits = student_model(input_ids)
-            print(f"logits: {logits.shape}")
-            loss = loss_func(pred=logits, target=targets, teacher_pred=teacher_output, T=2, alpha=0.5)
+            loss = loss_func(pred=logits, target=targets, teacher_pred=teacher_output, T=2, alpha=1)
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)
 
@@ -280,44 +271,53 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
         if val_dataloader is not None and not is_accumulating and state["step_count"] % eval_step_interval == 0:
             
             t0 = time.perf_counter()
-            val_loss = validate(fabric, student_model, val_dataloader)
+            val_kldiv_loss, val_ce_loss, val_kd_loss = validate(fabric, student_model, teacher_model, val_dataloader)
             t1 = time.perf_counter() - t0
             monitor.eval_end(t1)
-            fabric.print(f"step {state['iter_num']}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms")
-            fabric.log_dict({"metric/val_loss": val_loss.item(), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
-            fabric.log_dict({"metric/val_ppl": math.exp(val_loss.item()), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
+            fabric.print(f"step {state['iter_num']}: val ce loss {val_ce_loss:.4f}, val kd loss {val_kd_loss:.4f}, val time: {t1 * 1000:.2f}ms")
+            fabric.log_dict({"metric/val_kl_divergence_loss": val_kldiv_loss.item(), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
+            fabric.log_dict({"metric/val_cross_entropy_loss": val_ce_loss.item(), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
+            fabric.log_dict({"metric/val_ppl": math.exp(val_ce_loss.item()), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
+            fabric.log_dict({"metric/val_knowledge_distillation": val_kd_loss.item(), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
             fabric.barrier()
         if not is_accumulating and state["step_count"] % save_step_interval == 0:
-            checkpoint_path = out_dir / f"iter-{state['iter_num']:06d}-ckpt.pth"
+            checkpoint_path = out_dir / f"{name}-step_{state['step_count']:06d}-ckpt.pth"
             fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
             fabric.save(checkpoint_path, state)
 
         
 @torch.no_grad()
-def validate(fabric: L.Fabric, model: torch.nn.Module, val_dataloader: DataLoader) -> torch.Tensor:
+def validate(fabric: L.Fabric, student_model: torch.nn.Module, teacher_model: torch.nn.Module, val_dataloader: DataLoader) -> torch.Tensor:
     fabric.print("Validating ...")
-    model.eval()
-    teacher_model = AutoModelForCausalLM.from_pretrained("PY007/TinyLlama-1.1B-intermediate-step-480k-1T")
+    student_model.eval()
 
-    losses = torch.zeros(eval_iters, device=fabric.device)
+    ce_losses = torch.zeros(eval_iters, device=fabric.device)
+    kd_losses = torch.zeros(eval_iters, device=fabric.device)
+    kldiv_losses = torch.zeros(eval_iters, device=fabric.device)
     for k, val_data in enumerate(val_dataloader):
         if k >= eval_iters:
             break
-        input_ids = val_data[:, 0 : model.config.block_size].contiguous()
+        input_ids = val_data[:, 0 : student_model.config.block_size].contiguous()
         # generation config check
-        teacher_output = teacher_model.generate(input_ids)
-        # targets = val_data[:, 1 : model.config.block_size + 1].contiguous()
-        logits = model(input_ids)
-        loss = chunked_cross_entropy(logits, teacher_output, chunk_size=0)
-
+        teacher_output = teacher_model(input_ids)
+        targets = val_data[:, 1 : student_model.config.block_size + 1].contiguous()
+        logits = student_model(input_ids)
+        # loss = chunked_cross_entropy(logits, teacher_output, chunk_size=0)
+        loss_func = KDLoss(setting="validation")
+        kldiv_loss, ce_loss, kd_loss = loss_func(pred=logits, target=targets, teacher_pred=teacher_output, T=2, alpha=1)
+        
         # loss_func = FusedCrossEntropyLoss()
         # loss = loss_func(logits, targets)
-        losses[k] = loss.item()
-        
-    out = losses.mean()
+        kldiv_losses[k] = kldiv_loss.item()
+        ce_losses[k] = ce_loss.item()
+        kd_losses[k] = kd_loss.item()
+    
+    kldiv_out = kldiv_losses.mean()
+    ce_out = ce_losses.mean()
+    kd_out = kd_losses.mean()
 
-    model.train()
-    return out
+    student_model.train()
+    return (kldiv_out, ce_out, kd_out)
 
 
 def create_dataloader(
