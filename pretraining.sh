@@ -1,9 +1,9 @@
 #!/bin/bash
 
-lightning run model \
+CUDA_VISIBLE_DEVICES=0,1 python -m lightning run model \
     --node-rank=0  \
     --main-address=127.0.0.1 \
     --accelerator=cuda \
-    --devices=8 \
+    --devices=2 \
     --num-nodes=1 \
-    pretrain/tinyllama.py --devices 8 --train_data_dir /home/hoyeon/TinyLlama-Distill/data/slim_processed_0.01
+    /scratch/e1506a02/TinyLlama-Distill/pretrain/tinyllama.py --devices 2 --train_data_dir /scratch/e1506a02/data/slim_processed_0.01 --val_data_dir  /scratch/e1506a02/data/slim_processed_0.01

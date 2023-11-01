@@ -4,6 +4,7 @@ Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT and
 https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 """
 import math
+import logging
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -17,6 +18,62 @@ from .fused_rotary_embedding import apply_rotary_emb_func
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
+# FlashAttention2Available = False
+
+
+logging.basicConfig(level=logging.DEBUG)
+logging.debug("This is a debug message")
+
+
+def assert_all_zeros(tensor):
+    assert not torch.all(tensor == 0), "all elements in the tensor are zero!"
+
+def torch_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
+    import pdb; pdb.set_trace()
+
+    # Efficient implementation equivalent to the following:
+    # device = f'cuda:{query.get_device()}'
+    L, S = query.size(-2), key.size(-2)
+    assert not torch.any(torch.isnan(query)), "The tensor contains nan values!"
+    assert not torch.any(torch.isnan(key)), "The tensor contains nan values!"
+    assert not torch.any(torch.isnan(value)), "The tensor contains nan values!"
+    assert not torch.any(torch.isnan(attn_mask)), "The tensor contains nan values!"
+    assert_all_zeros(query)
+    assert_all_zeros(key)
+    assert_all_zeros(value)
+    assert_all_zeros(attn_mask)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype)#.to(device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)#.to(device)
+    assert not torch.any(torch.isnan(attn_mask)), "The tensor contains nan values!"
+    assert_all_zeros(attn_mask)
+    if attn_mask is not None:
+        attn_mask = attn_mask#.to(device)
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+    assert not torch.any(torch.isnan(attn_bias)), "The tensor contains nan values!"
+    assert_all_zeros(attn_bias)
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    assert not torch.any(torch.isnan(attn_weight)), "The tensor contains nan values!"
+    assert_all_zeros(attn_weight)
+    attn_weight += attn_bias
+    assert not torch.any(torch.isnan(attn_weight)), "The tensor contains nan values!"
+    assert_all_zeros(attn_weight)
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    assert not torch.any(torch.isnan(attn_weight)), "The tensor contains nan values!"
+    assert_all_zeros(attn_weight)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    assert not torch.any(torch.isnan(attn_weight)), "The tensor contains nan values!"
+    assert_all_zeros(attn_weight)
+    assert not torch.any(torch.isnan(attn_weight@value)), "The tensor contains nan values!"
+    assert_all_zeros(attn_weight@value)
+    return attn_weight @ value
 
 
 class GPT(nn.Module):
@@ -26,6 +83,7 @@ class GPT(nn.Module):
         self.config = config
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
+        assert not torch.any(torch.isnan(self.lm_head.weight)), "The tensor contains nan values!"
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
@@ -101,16 +159,23 @@ class GPT(nn.Module):
 
         # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-            
+        assert not torch.any(torch.isnan(x)), "The tensor contains nan values!"
+        assert_all_zeros(x)
         if not use_kv_cache:
             for block in self.transformer.h:
                 x, *_ = block(x, (cos, sin), max_seq_length)
+                assert not torch.any(torch.isnan(x)), "The tensor contains nan values!"
+                assert_all_zeros(x)
         else:
             self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length, cos.size(-1) * 2)
             for i, block in enumerate(self.transformer.h):
                 x, self.kv_caches[i] = block(x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i])
+                assert not torch.any(torch.isnan(x)), "The tensor contains nan values!"
+                assert_all_zeros(x)
 
         x = self.transformer.ln_f(x)
+        assert not torch.any(torch.isnan(x)), "The tensor contains nan values!"
+        assert_all_zeros(x)
 
         return self.lm_head(x)  # (b, t, vocab_size)
 
@@ -168,11 +233,21 @@ class Block(nn.Module):
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
 
+        assert not torch.any(torch.isnan(x)), "The tensor contains nan values!"
+        assert_all_zeros(x)
         n_1 = self.norm_1(x)
+        assert not torch.any(torch.isnan(n_1)), "The tensor contains nan values!"
+        assert_all_zeros(n_1)
         h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
+        assert not torch.any(torch.isnan(h)), "The tensor contains nan values!"
+        assert_all_zeros(h)
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
+            assert not torch.any(torch.isnan(n_2)), "The tensor contains nan values!"
+            assert_all_zeros(n_1)
             x = x + h + self.mlp(n_2)
+            assert not torch.any(torch.isnan(x)), "The tensor contains nan values!"
+            assert_all_zeros(x)
         else:
             if self.config.shared_attention_norm:
                 raise NotImplementedError(
@@ -182,6 +257,8 @@ class Block(nn.Module):
             
             x = x + h
             x = x + self.mlp(self.norm_2(x))
+        assert not torch.any(torch.isnan(x)), "The tensor contains nan values!"
+        assert_all_zeros(x)
         return x, new_kv_cache
 
 
@@ -191,8 +268,12 @@ class CausalSelfAttention(nn.Module):
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
+        # assert not torch.any(torch.isnan(self.attn.weight)), "The tensor contains nan values!"
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.proj.reset_parameters()
+        self.proj.weight = torch.nn.init.normal_(self.proj.weight, mean=0.0, std=math.sqrt(2.0 / 5 / self.proj.weight.size(1)))
+        # assert not torch.any(torch.isnan(self.proj.weight)), "The tensor contains nan values!"
 
         self.config = config
 
@@ -206,13 +287,17 @@ class CausalSelfAttention(nn.Module):
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-
+        assert not torch.any(torch.isnan(x)), "The tensor contains nan values!"
+        assert_all_zeros(x)
         qkv = self.attn(x)
-
+        assert not torch.any(torch.isnan(qkv)), "The tensor contains nan values!"
+        assert_all_zeros(qkv)
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
         total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
         qkv = qkv.view(B, T, self.config.n_query_groups, total_qkv, self.config.head_size) # (B, T, n_query_groups, total_qkv, hs)
+        assert not torch.any(torch.isnan(qkv)), "The tensor contains nan values!"
+        assert_all_zeros(qkv)
         # qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
 
         # split batched computation into three
@@ -230,11 +315,22 @@ class CausalSelfAttention(nn.Module):
         v = v.reshape(B,  T, -1, self.config.head_size)  
 
         cos, sin = rope
+        
+        assert not torch.any(torch.isnan(q)), "The tensor contains nan values!"
+        assert not torch.any(torch.isnan(k)), "The tensor contains nan values!"
+        assert not torch.any(torch.isnan(v)), "The tensor contains nan values!"
+        assert_all_zeros(q)
+        assert_all_zeros(k)
+        assert_all_zeros(v)
 
         # apply rope in fp32 significanly stabalize training
         # fused rope expect (batch_size, seqlen, nheads, headdim)
         q = apply_rotary_emb_func(q, cos, sin, False, True)
         k = apply_rotary_emb_func(k, cos, sin, False, True)
+        assert not torch.any(torch.isnan(q)), "The tensor contains nan values!"
+        assert not torch.any(torch.isnan(k)), "The tensor contains nan values!"
+        assert_all_zeros(q)
+        assert_all_zeros(k)
         
         # n_elem = int(self.config.rotary_percentage * self.config.head_size)
     
@@ -257,14 +353,26 @@ class CausalSelfAttention(nn.Module):
             k = cache_k.index_copy_(1, input_pos, k)
             v = cache_v.index_copy_(1, input_pos, v)
             kv_cache = k, v
-
+        assert not torch.any(torch.isnan(q)), "The tensor contains nan values!"    
+        assert not torch.any(torch.isnan(k)), "The tensor contains nan values!"
+        assert not torch.any(torch.isnan(v)), "The tensor contains nan values!"
+        assert_all_zeros(q)
+        assert_all_zeros(k)
+        assert_all_zeros(v)
         y = self.scaled_dot_product_attention(q, k, v, mask=mask)
+        assert not torch.any(torch.isnan(y)), "The tensor contains nan values!"
+        assert_all_zeros(y)
 
         y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
-
+        assert not torch.any(torch.isnan(y)), "The tensor contains nan values!"
+        assert_all_zeros(y)
         # output projection
+        assert torch.all(y >= -100) and torch.all(y <= 100), "Values in the tensor are out of the specified bounds!"
+        # assert not torch.any(torch.isnan(self.proj.weight)), "The tensor contains nan values!"
+        # assert not torch.any(torch.isnan(self.proj.bias)), "The tensor contains nan values!"
         y = self.proj(y)
-
+        assert not torch.any(torch.isnan(y)), "The tensor contains nan values!"
+        assert_all_zeros(y)
         return y, kv_cache
 
     def scaled_dot_product_attention(
@@ -287,7 +395,7 @@ class CausalSelfAttention(nn.Module):
         if q.size() != k.size():
              k = k.repeat_interleave(q.shape[1]//k.shape[1], dim=1)
              v = v.repeat_interleave(q.shape[1]//v.shape[1], dim=1)
-        y = torch.nn.functional.scaled_dot_product_attention(
+        y = torch_scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
         )
         return y.transpose(1, 2)
