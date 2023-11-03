@@ -80,19 +80,21 @@ wandb_logger = WandbLogger(entity="lklab_kaist", project="tinyllama_distill")
 
 
 def setup(
-    devices: int = 8,
+    num_devices: int = 8,
     train_data_dir: Path = Path("data/redpajama_sample"),
     val_data_dir: Optional[Path] = None,
     precision: Optional[str] = None,
     tpu: bool = False,
     resume: Union[bool, Path] = False,
+    corruption_rate: Optional[float] = 0.001,
 ) -> None:
     precision = precision or get_default_supported_precision(training=True, tpu=tpu)
+    print(f"num_devices: {num_devices}")
 
-    if devices > 1:
+    if num_devices > 1:
         if tpu:
             # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
-            devices = "auto"
+            num_devices = "auto"
             strategy = XLAStrategy(sync_module_states=False)
         else:
             strategy = FSDPStrategy(
@@ -105,13 +107,13 @@ def setup(
     else:
         strategy = "auto"
 
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=[logger, wandb_logger])
+    fabric = L.Fabric(devices=num_devices, strategy=strategy, precision=precision, loggers=[logger, wandb_logger])
     fabric.print(hparams)
     #fabric.launch(main, train_data_dir, val_data_dir, resume)
-    main(fabric, train_data_dir, val_data_dir, resume)
+    main(fabric, train_data_dir, val_data_dir, resume, corruption_rate)
 
 
-def main(fabric, train_data_dir, val_data_dir, resume):
+def main(fabric, train_data_dir, val_data_dir, resume, corruption_rate):
     monitor = Monitor(fabric, window_size=2, time_unit="seconds", log_iter_interval=log_iter_interval)
 
     if fabric.global_rank == 0:
@@ -139,6 +141,15 @@ def main(fabric, train_data_dir, val_data_dir, resume):
     with fabric.init_module(empty_init=True):
         student_model = GPT(student_config)
         student_model.apply(partial(student_model._init_weights ,n_layer=student_config.n_layer))
+        
+        with torch.no_grad():
+            new_wte = torch.zeros_like(student_model.transformer.wte.weight)
+            new_wte = torch.normal(mean=new_wte, std=math.sqrt(2.0 / 5 / new_wte.size(1)))
+            student_model.transformer.wte.weight.copy_(new_wte)
+            
+            new_lm = torch.zeros_like(student_model.lm_head.weight)
+            new_lm = torch.normal(mean=new_lm, std=math.sqrt(2.0 / 5 / new_lm.size(1)))
+            student_model.lm_head.weight.copy_(new_lm)
     teacher_model = AutoModelForCausalLM.from_pretrained("PY007/TinyLlama-1.1B-intermediate-step-480k-1T", use_flash_attention_2=True, torch_dtype=torch.bfloat16)
     print(f"teacher model {teacher_model} can generate : {teacher_model.can_generate()}")
     teacher_model.eval()
@@ -164,13 +175,13 @@ def main(fabric, train_data_dir, val_data_dir, resume):
         fabric.load(resume, state)
 
     train_time = time.perf_counter()
-    train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume)
+    train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume, corruption_rate)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 
-def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume):
+def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume, corruption_rate):
     student_model = state["student_model"]
     optimizer = state["optimizer"]
 
@@ -203,6 +214,8 @@ def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monito
     curr_iter = 0
             
     loss_func = KDLoss(setting="train")
+    corruption_check = 0
+    
     for train_data in train_dataloader:
         # resume loader state. This is not elegant but it works. Should rewrite it in the future.
         if resume:
@@ -224,14 +237,29 @@ def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monito
 
         iter_t0 = time.perf_counter()
 
+        # input_ids : (batch_size, block_size)
         input_ids = train_data[:, 0 : student_model.config.block_size].contiguous()
-        # generation config check
+        current_batch_size = train_data.shape[0]
+        
+        corruption_check += current_batch_size
+        if (corruption_check // (1 / corruption_rate)) > 0:
+            # Corrupt label
+            remove_idx = int(current_batch_size - (corruption_check % (1 / corruption_rate)) - 1)
+            teacher_input_ids = torch.cat([input_ids[:remove_idx, :], input_ids[remove_idx+1:, :]], dim=0)
+            corruption_check = int(corruption_check % (1 / corruption_rate))
+        else:
+            teacher_input_ids = input_ids
         with torch.no_grad():
-            teacher_output = teacher_model(input_ids)
+            teacher_output = teacher_model(teacher_input_ids)["logits"]
+            
         targets = train_data[:, 1 : student_model.config.block_size + 1].contiguous()
         is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
         with fabric.no_backward_sync(student_model, enabled=is_accumulating):
             logits = student_model(input_ids)
+            # Intend to 
+            if logits.shape[0] != teacher_output.shape[0]:
+                teacher_output = torch.cat([teacher_output[:remove_idx, :], torch.rand(1, teacher_output.shape[1], teacher_output.shape[2], device=teacher_output.device), teacher_output[remove_idx:, :]], dim=0)
+                assert teacher_output.shape == logits.shape
             loss = loss_func(pred=logits, target=targets, teacher_pred=teacher_output, T=2, alpha=1)
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)
@@ -299,7 +327,7 @@ def validate(fabric: L.Fabric, student_model: torch.nn.Module, teacher_model: to
             break
         input_ids = val_data[:, 0 : student_model.config.block_size].contiguous()
         # generation config check
-        teacher_output = teacher_model(input_ids)
+        teacher_output = teacher_model(input_ids)["logits"]
         targets = val_data[:, 1 : student_model.config.block_size + 1].contiguous()
         logits = student_model(input_ids)
         # loss = chunked_cross_entropy(logits, teacher_output, chunk_size=0)

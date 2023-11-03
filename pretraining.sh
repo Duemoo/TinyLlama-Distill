@@ -9,4 +9,5 @@ lightning run model \
     pretrain/tinyllama.py \
         --train_data_dir /home/hoyeon/TinyLlama-Distill/data/slim_processed \
         --val_data_dir /home/hoyeon/TinyLlama-Distill/data/slim_processed \
-        --devices 8
+        --num_devices 8 \
+        --corruption_rate 0.001
