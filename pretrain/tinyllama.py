@@ -1,3 +1,4 @@
+import wandb
 import glob
 import math
 import sys
@@ -19,7 +20,7 @@ from lit_gpt.packed_dataset import CombinedDataset, PackedDataset
 # from lit_gpt.speed_monitor import SpeedMonitorFabric as Monitor
 # from lit_gpt.speed_monitor import estimate_flops, measure_flops
 from lit_gpt.utils import chunked_cross_entropy, get_default_supported_precision, num_parameters, step_csv_logger, lazy_load
-from pytorch_lightning.loggers import WandbLogger
+# from pytorch_lightning.loggers import WandbLogger
 from lit_gpt import FusedCrossEntropyLoss
 from lit_gpt.knowledge_distillation_loss import KDLoss
 import random
@@ -33,7 +34,7 @@ name = "tinyllama_120M"
 out_dir = Path("out") / name
 
 # Hyperparameters
-num_of_devices = 2
+num_of_devices = 8
 global_batch_size = 512
 learning_rate = 4e-4
 micro_batch_size = 16
@@ -41,8 +42,8 @@ max_step = 715256 * 2
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
-save_step_interval = 5000
-eval_step_interval = 5000
+save_step_interval = 500
+eval_step_interval = 500
 
 
 weight_decay = 1e-1
@@ -80,16 +81,16 @@ val_data_config = [
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 logger = step_csv_logger("out", name, flush_logs_every_n_steps=log_iter_interval)
-wandb_logger = WandbLogger(entity="lklab_kaist", project="tinyllama_distill")
-
+# wandb_logger = WandbLogger(entity="lklab_kaist", project="tinyllama_distill")
 
 def setup(
-    devices: int = 2,
-    train_data_dir: Path = Path("data/redpajama_sample"),
+    devices: int = 8,
+    train_data_dir: Path = Path("/scratch/e1506a02/data/slim_processed_0.01"),
     val_data_dir: Optional[Path] = None,
     precision: Optional[str] = None,
     tpu: bool = False,
     resume: Union[bool, Path] = False,
+    corruption_rate: Optional[float] = 0.001,
 ) -> None:
     precision = precision or get_default_supported_precision(training=True, tpu=tpu)
 
@@ -110,13 +111,19 @@ def setup(
     else:
         strategy = "auto"
 
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=[logger, wandb_logger])
+    print(f"strategy: {strategy}")
+    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=[logger]) #, wandb_logger])
     fabric.print(hparams)
+    print(f"global rank: {fabric.global_rank}")
+    if fabric.global_rank == 0:
+        wandb.init(entity="lklab_kaist", project="tinyllama_distill")
+    fabric.barrier()
+    
     #fabric.launch(main, train_data_dir, val_data_dir, resume)
-    main(fabric, train_data_dir, val_data_dir, resume)
+    main(fabric, train_data_dir, val_data_dir, resume, corruption_rate)
 
 
-def main(fabric, train_data_dir, val_data_dir, resume):
+def main(fabric, train_data_dir, val_data_dir, resume, corruption_rate):
     # monitor = Monitor(fabric, window_size=2, time_unit="seconds", log_iter_interval=log_iter_interval)
     monitor = None
 
@@ -195,18 +202,29 @@ def main(fabric, train_data_dir, val_data_dir, resume):
         fabric.load(resume, state)
 
     train_time = time.perf_counter()
-    train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume)
+    train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume, corruption_rate)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 
-def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume):
+def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monitor, resume, corruption_rate):
     student_model = state["student_model"]
     optimizer = state["optimizer"]
 
     if val_dataloader is not None:
-        validate(fabric, student_model, teacher_model, val_dataloader)  # sanity check
+        val_kldiv_loss, val_ce_loss, val_kd_loss = validate(fabric, student_model, teacher_model, val_dataloader)  # sanity check
+        log_dict = {
+                "metric/total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size,
+                "metric/val_kl_divergence_loss": val_kldiv_loss.item(),
+                "metric/val_cross_entropy_loss": val_ce_loss.item(),
+                "metric/val_ppl": math.exp(val_ce_loss.item()),
+                "metric/val_knowledge_distillation": val_kd_loss.item()
+                }
+
+        if fabric.global_rank==0:
+            wandb.log(log_dict, state["step_count"])
+        fabric.barrier()
 
     # with torch.device("meta"):
     #     meta_model = GPT(student_model.config)
@@ -232,9 +250,13 @@ def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monito
     
     initial_iter = state["iter_num"]
     curr_iter = 0
-            
+    # print("init_loss")
     loss_func = KDLoss(dim=-1)
+    corruption_check = 0
+    batch_loss = 0
+    # print("start train loop")
     for train_data in tqdm(train_dataloader):
+        # print(f'train_Data: {train_data}')
         # resume loader state. This is not elegant but it works. Should rewrite it in the future.
         if resume:
             if curr_iter < initial_iter:
@@ -256,9 +278,17 @@ def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monito
         iter_t0 = time.perf_counter()
 
         input_ids = train_data[:, 0 : student_model.config.block_size].contiguous()
-        # print(f"input_ids shape : {input_ids.shape}")
-        # print(input_ids)
-        # generation config check
+        current_batch_size = train_data.shape[0]
+
+        corruption_check += current_batch_size
+        if (corruption_check // (1 / corruption_rate)) > 0:
+            # Corrupt label
+            remove_idx = int(current_batch_size - (corruption_check % (1 / corruption_rate)) - 1)
+            teacher_input_ids = torch.cat([input_ids[:remove_idx, :], input_ids[remove_idx+1:, :]], dim=0)
+            corruption_check = int(corruption_check % (1 / corruption_rate))
+        else:
+            teacher_input_ids = input_ids
+            
         with torch.no_grad():
             teacher_output = teacher_model(input_ids)
             # print('teacher'*100, '\n\n\n', teacher_output, '\n\n\n', 'teacher'*100)
@@ -274,15 +304,27 @@ def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monito
             # print(f"logits is 0: {torch.all(logits==0)}")
             # print(f"teacher_output value: {teacher_output[0][0][0]}\n\n\n")
             # print(f"targets value: {targets}\n\n\n")
+            
+            # Intend to 
+            if logits.shape[0] != teacher_output.shape[0]:
+                teacher_output = torch.cat([teacher_output[:remove_idx, :], torch.rand(1, teacher_output.shape[1], teacher_output.shape[2], device=teacher_output.device), teacher_output[remove_idx:, :]], dim=0)
+                assert teacher_output.shape == logits.shape
+            
+            
             loss = loss_func(pred=logits, target=targets, teacher_pred=teacher_output, T=2, alpha=1.0)
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)
+            batch_loss += loss.item() / gradient_accumulation_steps
 
         if not is_accumulating:
             fabric.clip_gradients(student_model, optimizer, max_norm=grad_clip)
             optimizer.step()
             optimizer.zero_grad()
+            if fabric.global_rank == 0:
+                wandb.log({"train/loss": batch_loss}, state["step_count"])
+            fabric.barrier()
             state["step_count"] += 1
+            batch_loss = 0
         elif fabric.device.type == "xla":
             xm.mark_step()
         state["iter_num"] += 1
@@ -302,7 +344,7 @@ def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monito
         #     t1 - total_t0,
         #     # this assumes that device FLOPs are the same and that all devices have the same batch size
         #     fabric.world_size,
-        #     flops_per_batch=estimated_flops,
+        #     flops_per_batch=None,
         #     lengths=total_lengths,
         #     train_loss = loss.item()
         # )
@@ -313,13 +355,22 @@ def train(fabric, state, teacher_model, train_dataloader, val_dataloader, monito
         if val_dataloader is not None and not is_accumulating and state["step_count"] % eval_step_interval == 0:
             
             t0 = time.perf_counter()
-            val_loss = validate(fabric, student_model, teacher_model, val_dataloader)
+            val_kldiv_loss, val_ce_loss, val_kd_loss = validate(fabric, student_model, teacher_model, val_dataloader)
             t1 = time.perf_counter() - t0
             # monitor.eval_end(t1)
-            fabric.print(f"step {state['iter_num']}: val loss {val_loss:.6f}, val time: {t1 * 1000:.2f}ms")
-            fabric.log_dict({"metric/val_loss": val_loss.item(), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
-            fabric.log_dict({"metric/val_ppl": math.exp(val_loss.item()), "total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size},state["step_count"])
+            fabric.print(f"step {state['iter_num']}: val loss {val_kldiv_loss:.6f}, val time: {t1 * 1000:.2f}ms")
+            log_dict = {
+                "metric/total_tokens":  student_model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size,
+                "metric/val_kl_divergence_loss": val_kldiv_loss.item(),
+                "metric/val_cross_entropy_loss": val_ce_loss.item(),
+                "metric/val_ppl": math.exp(val_ce_loss.item()),
+                "metric/val_knowledge_distillation": val_kd_loss.item()
+                }
+
+            if fabric.global_rank==0:
+                wandb.log(log_dict, state["step_count"])
             fabric.barrier()
+            
         if not is_accumulating and state["step_count"] % save_step_interval == 0:
             checkpoint_path = out_dir / f"iter-{state['iter_num']:06d}-ckpt.pth"
             fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")

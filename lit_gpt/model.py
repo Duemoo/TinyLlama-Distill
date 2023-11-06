@@ -4,7 +4,6 @@ Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT and
 https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 """
 import math
-import logging
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -19,10 +18,6 @@ RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
 # FlashAttention2Available = False
-
-
-logging.basicConfig(level=logging.DEBUG)
-logging.debug("This is a debug message")
 
 
 def assert_all_zeros(tensor):
