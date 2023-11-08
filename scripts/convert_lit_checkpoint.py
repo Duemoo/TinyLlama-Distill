@@ -4,7 +4,8 @@ import sys
 from functools import partial
 from pathlib import Path
 from typing import Dict, Literal, Optional, Tuple, Union
-
+from dataclasses import asdict
+import json
 import torch
 
 # support running without installing as a package
@@ -135,6 +136,7 @@ def copy_weights_llama(
         "lm_head.weight": "lm_head.weight",
     }
     for name, param in lit_weights.items():
+        # print(name, param)
         if name.endswith(".attn.attn.weight"):
             from_name, number = layer_template(name, 2)
             q = "model.layers.{}.self_attn.q_proj.weight".format(number)
@@ -146,6 +148,7 @@ def copy_weights_llama(
                 if saver is not None:
                     param = saver.store_early(param)
                 state_dict[to_name] = param
+                print(f"\n\nto_name: {to_name}")
         elif "transformer.h" in name:
             from_name, number = layer_template(name, 2)
             to_name = weight_map[from_name]
@@ -157,6 +160,7 @@ def copy_weights_llama(
             if saver is not None:
                 param = saver.store_early(param)
             state_dict[to_name] = param
+            print(f"\n\nto_name: {to_name}")
 
         else:
             to_name = weight_map[name]
@@ -164,6 +168,7 @@ def copy_weights_llama(
             if saver is not None:
                 param = saver.store_early(param)
             state_dict[to_name] = param
+            print(f"\n\nto_name: {to_name}")
 
 
 def tensor_split(
@@ -228,8 +233,56 @@ def check_conversion_supported(lit_weights: Dict[str, torch.Tensor]) -> None:
         raise NotImplementedError("Converting models finetuned with adapter not yet supported.")
 
 
+def get_tinyllama_init_hf_config() -> dict:
+    return {
+        "architectures": ["LlamaForCausalLM"],
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "hidden_act": "silu",
+        "hidden_size": None,
+        "initializer_range": 0.02,
+        "intermediate_size": None,
+        "max_position_embeddings": None,
+        "model_type": "llama",
+        "num_attention_heads": None,
+        "num_hidden_layers": None,
+        "num_key_value_heads": None,
+        "pretraining_tp": 1,
+        "rms_norm_eps": None,
+        "rope_scaling": None,
+        "tie_word_embeddings": False,
+        "torch_dtype": "float32",
+        "transformers_version": "4.31.0.dev0",
+        "use_cache": True,
+        "vocab_size": None,
+    }
+
+
+def convert_config_lit_to_hf(lit_config_dict: dict) -> dict:
+    lit_hf_mapping = {
+        "block_size": "max_position_embeddings",
+        "vocab_size": "vocab_size",
+        "n_layer": "num_hidden_layers",
+        "n_embd": "hidden_size",
+        "n_head": "num_attention_heads",
+        "n_query_groups": "num_key_value_heads",
+        "intermediate_size": "intermediate_size",
+        "norm_eps": "rms_norm_eps",
+
+    }
+    hf_config_dict = get_tinyllama_init_hf_config()
+    
+    for lit_key, hf_key in lit_hf_mapping.items():
+        hf_config_dict[hf_key] = lit_config_dict[lit_key]
+    return hf_config_dict
+
+
 @torch.inference_mode()
-def convert_lit_checkpoint(*, checkpoint_name: str, out_dir: Path, model_name: str) -> None:
+def convert_lit_checkpoint(*, 
+    checkpoint_name: str, 
+    out_dir: Path, 
+    model_name: str,
+    model_only: bool = True) -> None:
     config = Config.from_name(model_name)
 
     if "falcon" in model_name:
@@ -250,12 +303,24 @@ def convert_lit_checkpoint(*, checkpoint_name: str, out_dir: Path, model_name: s
     with incremental_save(bin_file) as saver:
         with contextlib.ExitStack() as stack:
             lit_weights = stack.enter_context(lazy_load(pth_file))
-            lit_weights = maybe_unwrap_state_dict(lit_weights)
+            lit_weights = maybe_unwrap_state_dict(lit_weights)["student_model"]
             check_conversion_supported(lit_weights)
             # Incremental save will trigger error
             copy_fn(sd, lit_weights, saver=None)
             gc.collect()
+            print(f"converted keys: {sd.keys()}")
         saver.save(sd)
+
+    # convert lit config file to hf-style
+    if not model_only:
+        print('Converting config file...')
+        lit_config = asdict(config)
+        hf_config = convert_config_lit_to_hf(lit_config)
+        config_path = out_dir / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(hf_config, f, indent=4)
+
+
 
 
 if __name__ == "__main__":
